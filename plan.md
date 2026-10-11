@@ -77,8 +77,7 @@ Fail to next layer when ANY of:
   concurrency semaphore 2, per-request timeout, stateless container.
 - quadlet: `.build` (ImageTag localhost/playwright-ai:latest) + `.container`
   (Network=ai.network, ContainerName=playwright-ai, PublishPort
-  127.0.0.1:8899:8080 loopback-only, Restart=on-failure). Future REST layer
-  reaches it as `playwright-ai:8899` via container DNS.
+  127.0.0.1:8899:8080 loopback-only, Restart=on-failure).
 - Chromium flags: --no-sandbox, --disable-dev-shm-usage (rootless podman).
 
 ## L2 provider — Exa (chosen in discussion)
