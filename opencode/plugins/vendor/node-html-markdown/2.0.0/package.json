@@ -48,7 +48,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "node-html-parser": "6.1.13"
+    "node-html-parser": "^6.1.13"
   },
   "devDependencies": {
     "@types/jest": "^29.0.0",
