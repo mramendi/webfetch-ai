@@ -393,9 +393,17 @@ async function redditViaApify(url, budgetMs, outerSignal) {
   const t0 = Date.now()
   const token = process.env.APIFY_TOKEN
   if (!token) return { ok: false, reason: "no APIFY_TOKEN" }
-  // only thread URLs — subreddit/user/search URLs stay on the Exa path
-  const m = url.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i)
-  if (!m) return { ok: false, reason: "not a thread URL; skipping apify" }
+  const target = url.replace(/^(https?:\/\/)[^/]+/i, "$1www.reddit.com")
+  // Two accepted shapes: classic thread URLs (/comments/<id>[/slug]/) and
+  // /s/ share links (the form Reddit's Share button produces). NOTE: share
+  // links CANNOT be resolved locally — reddit 403s the short URL itself
+  // (verified 2026-10-11, even with a browser UA), but the actor's stealth
+  // browser resolves them; its returned post.url is the canonical thread.
+  // Subreddit/user/search URLs stay on the Exa path.
+  const isThread = /reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i.test(target)
+  const isShare = /reddit\.com\/(?:r\/[^/]+\/)?s\/[A-Za-z0-9]+/i.test(target)
+  if (!isThread && !isShare) return { ok: false, reason: "not a thread URL; skipping apify" }
+  const m = target.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i)
   const maxComments = Math.max(1, Math.min(50, Number(process.env.APIFY_MAX_COMMENTS) || 15))
   try {
     const res = await timedFetch(
@@ -404,9 +412,7 @@ async function redditViaApify(url, budgetMs, outerSignal) {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         body: JSON.stringify({
-          // normalize host: old.reddit / np.reddit / bare comment-ID forms
-          // all redirect; the actor handles www.reddit.com natively
-          startUrls: [{ url: url.replace(/^(https?:\/\/)[^/]+/i, "$1www.reddit.com") }],
+          startUrls: [{ url: target }],
           maxItems: maxComments + 1,
           maxPostCount: 1,
           maxComments,
@@ -432,7 +438,7 @@ async function redditViaApify(url, budgetMs, outerSignal) {
     const header = [
       post.title ? `# ${post.title}` : "",
       [
-        post.communityName || (m[1] ? `r/${m[1]}` : ""),
+        post.communityName || (m && m[1] ? `r/${m[1]}` : ""),
         post.username ? `u/${post.username}` : "",
         Number.isFinite(post.upVotes) ? `${post.upVotes} upvotes` : "",
         post.createdAt ? String(post.createdAt).slice(0, 10) : "",
@@ -459,7 +465,7 @@ async function redditViaApify(url, budgetMs, outerSignal) {
     ]
       .filter(Boolean)
       .join("\n\n")
-    return { ok: true, items: items.length, content, ms: Date.now() - t0 }
+    return { ok: true, items: items.length, content, resolvedUrl: post.url, ms: Date.now() - t0 }
   } catch (error) {
     return { ok: false, reason: `apify: ${String(error).slice(0, 120)}` }
   }
@@ -661,7 +667,7 @@ async function fetchChain(input, signal) {
     if (apify.ok) {
       return {
         content: apify.content.slice(0, MAX_CHARS),
-        metadata: { layer: "apify", finalUrl: url, items: apify.items },
+        metadata: { layer: "apify", finalUrl: apify.resolvedUrl || url, items: apify.items },
       }
     }
     const exa = await fetchExa(url, budget.l2, signal, maxChars)

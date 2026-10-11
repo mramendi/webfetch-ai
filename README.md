@@ -60,7 +60,9 @@ request
   │    issue/PR→API+comments; failure falls through to the general chain)
   │
   ├─ reddit.com ──────────────────────────────► Apify reddit-scraper-lite
-  │    (full thread: post body + comments with authors/votes.
+  │    (full thread: post body + comments with authors/votes. Accepts
+  │     classic /comments/<id> URLs AND /s/ share links — the short form
+  │     is 403'd to plain clients but resolved by the actor's browser.
   │     fallbacks: Exa /contents → Exa keyless MCP search-cache → chain.
   │     Reddit 403s all direct fetching since the 2026 lockdown)
   │
@@ -176,7 +178,8 @@ repo/blob/issue, PDF, Reddit thread, and a documented expected-fail
   path live-verified after an early bug (L1 results were being discarded —
   fixed); L2 metered path exercised only when lower layers fail.
 - Reddit lane: full-thread fetch live-verified on real threads, including
-  cross-host redirects (`old.reddit.com` → canonical).
+  cross-host redirects (`old.reddit.com` → canonical) and `/s/` share
+  links (resolved by the actor's browser — the short URL 403s locally).
 - All external endpoints are probed at runtime with graceful degradation;
   nothing is assumed reachable.
 

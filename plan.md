@@ -188,3 +188,10 @@ probe against the live service. Overnight arc complete.
    (5 items, ~$0.017) and a redirect case via old.reddit (16 items, 68s).
    Token: APIFY_TOKEN in load-secrets.sh; service restart required after
    adding (TUI restart spawning the server suffices).
+9. **Share links closed (2026-10-11 evening):** `/r/<sub>/s/<token>` URLs
+   now pass the lane gate. They CANNOT be resolved locally — reddit 403s
+   the short URL itself (verified, even with browser UA) — but the actor's
+   stealth browser resolves them; post.url in the dataset is the canonical
+   thread and is surfaced as finalUrl metadata. One transient 502 observed
+   from the run-sync endpoint (retry succeeded); actor output quality
+   varies run-to-run in fast-RSS mode (entities, missing upVotes).
