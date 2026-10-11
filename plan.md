@@ -197,3 +197,13 @@ probe against the live service. Overnight arc complete.
    thread and is surfaced as finalUrl metadata. One transient 502 observed
    from the run-sync endpoint (retry succeeded); actor output quality
    varies run-to-run in fast-RSS mode (entities, missing upVotes).
+10. **LICENSE = The Unlicense (2026-10-11):** the code is AI-generated, so
+    "is it copyrightable" is a live debate the owner declines to enter —
+    least of all over infrastructure. The Unlicense (OSI-approved
+    2020-06-12, SPDX `Unlicense`) has the CC0-shaped property that makes
+    the debate moot: if no copyright subsists there is nothing to
+    dedicate; if some does, it is all given away. Chosen over CC0 because
+    the Unlicense IS OSI-approved while CC0 never reached consensus
+    (patent non-waiver), and a patent grant is moot for this artifact.
+    MIT-style headers rejected because a `Copyright (c)` line asserts
+    ownership — precisely the contested claim.

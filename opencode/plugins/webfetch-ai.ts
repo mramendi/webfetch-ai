@@ -1,4 +1,5 @@
 // webfetch-ai — layered web fetching for OpenCode (v2.0.26).
+// SPDX-License-Identifier: Unlicense
 //
 // Registers a tool named `webfetch` that REPLACES the built-in (verified:
 // user plugins activate after internal tools; Editor.add is Map.set).

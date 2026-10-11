@@ -202,3 +202,9 @@ repo/blob/issue, PDF, Reddit thread, and a documented expected-fail
 - **No anonymity guarantees.** L0 sends a Chrome UA; L1 uses a stealth
   chromium; Reddit lane goes through Apify's infrastructure. Pick per your
   threat model.
+
+## License
+
+[The Unlicense](https://unlicense.org) — dedicated to the public domain to
+the fullest extent allowed by law; no attribution required. Full text in
+[`LICENSE`](LICENSE).
