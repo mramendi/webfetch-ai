@@ -149,3 +149,7 @@ scratch in /srv/ssd/tmp/opencode/.
 7. **Test matrix** (live): friendly/spa/notfound/gh_repo/gh_blob/gh_issue/pdf
    pass; reddit + bot-wall documented as expected-fail. Latencies: L0
    10-80ms, github 10-460ms, L1 0.9-1.5s, L2 0.2-0.3s.
+
+Final deploy check (03:16 UTC): the deployed
+~/.config/opencode/plugins/webfetch-ai.ts passes a fresh L0 + github-lane
+probe against the live service. Overnight arc complete.
