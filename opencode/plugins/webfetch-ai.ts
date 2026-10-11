@@ -559,7 +559,9 @@ async function fetchChain(input, signal) {
   }
 
   const tried = attempts.map((a) => `${a.layer}${a.ok ? "✓" : `✗(${a.reason || ""})`}`).join(" → ")
-  throw new Error(`Unable to fetch ${url}. Attempts: ${tried}. Last error: ${l1.reason || l0.verdict.reason}`)
+  const err = new Error(`Unable to fetch ${url}. Attempts: ${tried}. Last error: ${l1.reason || l0.verdict.reason}`)
+  err.recoverable = false
+  throw err
 }
 
 // ---------------------------------------------------------------- plugin
