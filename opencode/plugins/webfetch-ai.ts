@@ -246,8 +246,10 @@ async function fetchExa(url, budgetMs, outerSignal, maxChars) {
       body: JSON.stringify({
         urls: [url],
         text: { maxCharacters: Math.min(maxChars, 100_000) },
-        maxAgeHours: 24, // force live crawl when cache is older; fresh cache still serves fast
-        livecrawlTimeout: Math.min(25_000, Math.max(5_000, Math.round(budgetMs * 1000))),
+        // maxAgeHours forces a live crawl when the cache entry is older; fresh
+        // cache still serves fast. (livecrawl option is deprecated and
+        // mutually exclusive with this.)
+        maxAgeHours: 24,
       }),
     },
     Math.round(budgetMs * 1000) + 5_000,
