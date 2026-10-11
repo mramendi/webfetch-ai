@@ -1,0 +1,10 @@
+# playwright-ai: independent Playwright fetch service (NOT the OWUI bundle).
+# Official image brings Node + Chromium + all system deps; we add a small
+# extraction stack (jsdom + readability + node-html-markdown) and the service.
+# Version tag is current-stable at build time; bump = edit this line + rebuild.
+FROM mcr.microsoft.com/playwright:v1.64.0-noble
+WORKDIR /app
+COPY package.json fetch-server.mjs ./
+RUN npm install --omit=dev --no-audit --no-fund
+EXPOSE 8080
+CMD ["node", "fetch-server.mjs"]

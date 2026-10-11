@@ -1,0 +1,23 @@
+[Unit]
+Description=Playwright fetch service (webfetch-ai layer 1) on 127.0.0.1:8899
+After=ai-network.service
+Wants=ai-network.service
+
+[Container]
+Image=localhost/playwright-ai:latest
+ContainerName=playwright-ai
+Network=ai.network
+# Loopback for host consumers (opencode service); containers reach
+# playwright-ai:8080 via ai.network DNS (future REST layer).
+PublishPort=127.0.0.1:8899:8080
+# Chromium under rootless podman: bigger /dev/shm + relaxed seccomp.
+# Local-only published port; loopback exposure only.
+PodmanArgs=--shm-size=1g --security-opt seccomp=unconfined
+StopTimeout=30
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

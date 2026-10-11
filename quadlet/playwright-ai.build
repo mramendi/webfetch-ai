@@ -1,0 +1,7 @@
+[Unit]
+Description=Build localhost/playwright-ai (Playwright + fetch/extraction service)
+# Prune recovery: systemctl --user start playwright-ai-build
+
+[Build]
+ImageTag=localhost/playwright-ai:latest
+File=%h/.config/containers/playwright-ai/Containerfile

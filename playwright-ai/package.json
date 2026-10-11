@@ -1,0 +1,12 @@
+{
+  "name": "playwright-ai-fetch",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "HTTP fetch service: stealth Chromium render + readability extraction -> markdown",
+  "dependencies": {
+    "@mozilla/readability": "latest",
+    "jsdom": "latest",
+    "node-html-markdown": "latest"
+  }
+}
