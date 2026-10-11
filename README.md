@@ -6,6 +6,10 @@
 > public because it works and is live-tested, but the author does not stand
 > over it yet. Read before you trust it with anything that matters.
 
+> Moreover: it uses interfaces discovered by reading the source code of
+> OpenCode 2.0.26. There is no guarantee the plugin will cleanly install
+> and work in any other version.
+
 Layered web fetching for [OpenCode](https://opencode.ai), replacing the
 built-in `webfetch` tool with a resilient chain: plain HTTP first, then a
 headless-Chromium service, then the Exa extract API — plus dedicated lanes
