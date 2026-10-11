@@ -28,7 +28,7 @@ const LOG_FILE = process.env.WEBFETCH_LOG_FILE || path.join(HOME, ".local/share/
 const PLAYWRIGHT_URL = process.env.WEBFETCH_PLAYWRIGHT_URL || "http://127.0.0.1:8899/fetch"
 const EXA_CONTENTS_URL = "https://api.exa.ai/contents"
 const MAX_CHARS = 400_000
-const MIN_TEXT_HTML = 300
+const MIN_TEXT_HTML = 120
 const MIN_TEXT_PLAIN = 50
 
 // Chrome-family UA without any bot tell (plain fetch layer only; L1 has its own).
@@ -73,27 +73,34 @@ const SKIP_TAGS = new Set([
 
 function stripHtmlToText(html) {
   let out = ""
-  let skipping = 0
   let i = 0
   const n = html.length
+  // stack-based skip: a <style> inside <head> must not be un-skipped by a
+  // stray </head> before its own closer (attribute values may contain ">").
+  // Void elements never get closing tags; a push-based stack would never pop
+  // them. Only push tags that have real closers; void and self-closed tags
+  // just toggle nothing.
+  const VOID_TAGS = new Set([
+    "meta", "link", "br", "hr", "img", "input", "source", "wbr", "col", "area", "base", "embed", "track", "param",
+  ])
+  const skipStack = []
   while (i < n) {
     if (html[i] === "<") {
       const close = html.indexOf(">", i)
       if (close === -1) break
-      const tag = html.slice(i + 1, close).trim().toLowerCase()
-      if (tag.startsWith("/")) {
-        const name = tag.slice(1).split(/\s/)[0]
-        if (SKIP_TAGS.has(name)) skipping = Math.max(0, skipping - 1)
-      } else if (!tag.startsWith("!") && !tag.endsWith("/")) {
-        const name = tag.split(/\s/)[0]
-        if (SKIP_TAGS.has(name)) skipping++
-        // block-level boundaries become whitespace so words don't fuse
+      const rawTag = html.slice(i + 1, close)
+      if (rawTag.startsWith("/")) {
+        const name = rawTag.slice(1).trim().toLowerCase().split(/\s/)[0]
+        if (skipStack[skipStack.length - 1] === name) skipStack.pop()
+      } else if (!rawTag.startsWith("!") && !rawTag.endsWith("/")) {
+        const name = rawTag.trim().toLowerCase().split(/[\s/]/)[0]
+        if (SKIP_TAGS.has(name) && !VOID_TAGS.has(name)) skipStack.push(name)
         if (/^(p|div|br|li|tr|h[1-6]|section|article|blockquote|pre|table)$/.test(name)) out += "\n"
       }
       i = close + 1
       continue
     }
-    if (skipping === 0) out += html[i]
+    if (skipStack.length === 0) out += html[i]
     i++
   }
   return out
@@ -520,7 +527,7 @@ async function fetchChain(input, signal) {
   const l1Usable =
     l1.ok &&
     l1.status < 400 &&
-    (l1.textLen || 0) >= MIN_TEXT_HTML &&
+    (l1.textLen || 0) >= MIN_TEXT_PLAIN &&
     !CHALLENGE_MARKERS.some((m) => (l1.markdown || "").slice(0, 4096).toLowerCase().includes(m))
 
   if (l1Usable) {
@@ -593,3 +600,6 @@ export const WebfetchAiPlugin = {
 }
 
 export default WebfetchAiPlugin
+
+// test hook: the harness imports this directly (no plugin runtime needed)
+export const __tests = { fetchChain, ghParse, gateL0, classifyBody, route, stripHtmlToText }
