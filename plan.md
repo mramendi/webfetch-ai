@@ -187,7 +187,9 @@ probe against the live service. Overnight arc complete.
    webfetch with timeout≥120 for reddit URLs. Live-verified: r/Rag 1f9281b
    (5 items, ~$0.017) and a redirect case via old.reddit (16 items, 68s).
    Token: APIFY_TOKEN in load-secrets.sh; service restart required after
-   adding (TUI restart spawning the server suffices).
+   adding (TUI restart spawning the server suffices). Single 5xx retry
+   after a fixed 5 s wait implemented in-lane (transient 502 observed live
+   2026-10-11; retry succeeded).
 9. **Share links closed (2026-10-11 evening):** `/r/<sub>/s/<token>` URLs
    now pass the lane gate. They CANNOT be resolved locally — reddit 403s
    the short URL itself (verified, even with browser UA) — but the actor's

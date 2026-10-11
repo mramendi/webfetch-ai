@@ -406,27 +406,35 @@ async function redditViaApify(url, budgetMs, outerSignal) {
   const m = target.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i)
   const maxComments = Math.max(1, Math.min(50, Number(process.env.APIFY_MAX_COMMENTS) || 15))
   try {
-    const res = await timedFetch(
-      APIFY_RUN_URL,
-      {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({
-          startUrls: [{ url: target }],
-          maxItems: maxComments + 1,
-          maxPostCount: 1,
-          maxComments,
-          skipCommunity: true,
-          includeMediaLinks: false,
-          navigationTimeout: 30,
-          proxy: { useApifyProxy: true },
-        }),
-      },
-      // browser-based scrape: runs legitimately take 30-90s — longer than
-      // any single chain layer, so give it the whole budget plus slack
-      Math.min(budgetMs + 60_000, 180_000),
-      outerSignal,
-    )
+    // Browser-based scrape: runs legitimately take 30-90s — longer than any
+    // single chain layer, so give the run the whole budget plus slack.
+    // ONE retry on 5xx after a fixed 5 s wait — the run-sync endpoint has
+    // shown transient 502s (actor platform flakiness, observed live
+    // 2026-10-11). 4xx is never retried. Each attempt gets the full budget;
+    // the caller's own timeout remains the hard ceiling.
+    const apifyInit = {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        startUrls: [{ url: target }],
+        maxItems: maxComments + 1,
+        maxPostCount: 1,
+        maxComments,
+        skipCommunity: true,
+        includeMediaLinks: false,
+        navigationTimeout: 30,
+        proxy: { useApifyProxy: true },
+      }),
+    }
+    const runBudget = Math.min(budgetMs + 60_000, 180_000)
+    let res = await timedFetch(APIFY_RUN_URL, apifyInit, runBudget, outerSignal)
+    if (res.status >= 500) {
+      try {
+        await res.body?.cancel()
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 5_000))
+      res = await timedFetch(APIFY_RUN_URL, apifyInit, runBudget, outerSignal)
+    }
     const items = await res.json().catch(() => null)
     if (!res.ok || !Array.isArray(items)) {
       const detail = items ? JSON.stringify(items).slice(0, 160) : res.statusText

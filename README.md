@@ -104,7 +104,8 @@ search-cache path), no playwright-ai container skips L1.
 
 **Runtime expectation:** the Reddit lane is browser-based and takes
 **60–90 s** — call it with `timeout: 120` or higher. Everything else
-completes in seconds.
+completes in seconds. A transient 5xx from the Apify run endpoint is
+retried exactly once (fixed 5 s wait; 4xx never retried).
 
 Every attempt is logged (JSONL) to `~/.local/share/opencode/webfetch-cycle.log`
 including which layer served the result. Note for adopters: this means
