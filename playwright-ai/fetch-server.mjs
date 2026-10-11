@@ -29,9 +29,14 @@ async function launch() {
       "--disable-blink-features=AutomationControlled",
     ],
   })
-  // playwright's default UA advertises "HeadlessChrome" — strip the tell.
-  const ua = await browser.userAgent()
-  if (ua) browserUA = ua.replace("HeadlessChrome/", "Chrome/")
+  // Build a de-teletubied UA from the bundled chromium's version
+  // (Browser.userAgent() was removed in newer playwright).
+  try {
+    const major = String(browser.version() || "131").split(".")[0]
+    browserUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`
+  } catch {
+    /* keep the hardcoded fallback UA */
+  }
   console.log(`fetch-server: browser ready, UA=${browserUA}`)
 }
 
