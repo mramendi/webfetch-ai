@@ -5,6 +5,8 @@
 FROM mcr.microsoft.com/playwright:v1.64.0-noble
 WORKDIR /app
 COPY package.json fetch-server.mjs ./
-RUN npm install --omit=dev --no-audit --no-fund
+# playwright pkg must match the image version; browsers come from the image's
+# PLAYWRIGHT_BROWSERS_PATH=/ms-playwright, so skip the postinstall download.
+RUN PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --omit=dev --no-audit --no-fund
 EXPOSE 8080
 CMD ["node", "fetch-server.mjs"]
