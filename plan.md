@@ -171,3 +171,20 @@ probe against the live service. Overnight arc complete.
    -> general chain. Verified on r/Rag thread 1f9281b: real cached text,
    zero metered cost. Highlights are truncated excerpts, not full threads
    — partial win, honest label in the output header.
+
+---
+## Apify lane (2026-10-11 evening)
+
+8. **Reddit primary lane: Apify reddit-scraper-lite**
+   (`trudax~reddit-scraper-lite`, pay-per-result ~$0.0034/item).
+   comchat/reddit-api-scraper was REJECTED for this lane — keyword/subreddit
+   search only, cannot fetch by URL. trudax takes startUrls and returns post
+   body + comments with authors/votes; Reddit IDs are global so any host
+   (old./np./www) or bare-ID URL redirects fine. Lane order: apify →
+   exa /contents → exa mcp search-cache → general chain. Cost cap:
+   maxComments 15 (env APIFY_MAX_COMMENTS), ~$0.05/fetch ceiling; free plan
+   $5/mo ≈ ~100 capped fetches. Runtime 60-90s (browser-based) — call
+   webfetch with timeout≥120 for reddit URLs. Live-verified: r/Rag 1f9281b
+   (5 items, ~$0.017) and a redirect case via old.reddit (16 items, 68s).
+   Token: APIFY_TOKEN in load-secrets.sh; service restart required after
+   adding (TUI restart spawning the server suffices).

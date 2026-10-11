@@ -4,7 +4,7 @@
 // user plugins activate after internal tools; Editor.add is Map.set).
 //
 // Chain:
-//   special paths  → GitHub URL algebra (raw/API, no auth) | Reddit → Exa
+//   special paths  → GitHub URL algebra (raw/API, no auth) | Reddit → Apify → Exa
 //   L0 plain fetch → deterministic quality gate (no LLM in the loop)
 //   L1 playwright-ai container (stealth chromium render, local :8899)
 //   L2 Exa /contents ($1/1k pages, free-tier credits; live crawl)
@@ -373,6 +373,98 @@ async function redditViaExaSearch(url, budgetMs, outerSignal, maxChars) {
   }
 }
 
+// ---------------------------------------------------------------- Reddit via Apify (primary)
+
+/**
+ * Full-fidelity thread fetch via Apify's pay-per-result actor
+ * (trudax/reddit-scraper-lite). Probed live 2026-10-11: post body + comments
+ * with authors/votes, 5 items ≈ $0.017 of the free $5 monthly credit.
+ * Preferred over the Exa cache path, which only surfaces truncated
+ * highlights and no comments. Cost is capped: maxComments (env
+ * APIFY_MAX_COMMENTS, default 15) × $0.0034/result ≈ $0.05/fetch ceiling;
+ * the free plan covers roughly 100 capped fetches/month. Note the comchat
+ * search-only actor was rejected for this lane: it cannot fetch by URL.
+ */
+const APIFY_RUN_URL =
+  "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items"
+const APIFY_USD_PER_RESULT = 0.0034
+
+async function redditViaApify(url, budgetMs, outerSignal) {
+  const t0 = Date.now()
+  const token = process.env.APIFY_TOKEN
+  if (!token) return { ok: false, reason: "no APIFY_TOKEN" }
+  // only thread URLs — subreddit/user/search URLs stay on the Exa path
+  const m = url.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i)
+  if (!m) return { ok: false, reason: "not a thread URL; skipping apify" }
+  const maxComments = Math.max(1, Math.min(50, Number(process.env.APIFY_MAX_COMMENTS) || 15))
+  try {
+    const res = await timedFetch(
+      APIFY_RUN_URL,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          // normalize host: old.reddit / np.reddit / bare comment-ID forms
+          // all redirect; the actor handles www.reddit.com natively
+          startUrls: [{ url: url.replace(/^(https?:\/\/)[^/]+/i, "$1www.reddit.com") }],
+          maxItems: maxComments + 1,
+          maxPostCount: 1,
+          maxComments,
+          skipCommunity: true,
+          includeMediaLinks: false,
+          navigationTimeout: 30,
+          proxy: { useApifyProxy: true },
+        }),
+      },
+      // browser-based scrape: runs legitimately take 30-90s — longer than
+      // any single chain layer, so give it the whole budget plus slack
+      Math.min(budgetMs + 60_000, 180_000),
+      outerSignal,
+    )
+    const items = await res.json().catch(() => null)
+    if (!res.ok || !Array.isArray(items)) {
+      const detail = items ? JSON.stringify(items).slice(0, 160) : res.statusText
+      return { ok: false, reason: `apify ${res.status}: ${detail}` }
+    }
+    const post = items.find((it) => it?.dataType === "post")
+    if (!post?.body) return { ok: false, reason: `apify: no post in ${items.length} items` }
+    const comments = items.filter((it) => it?.dataType === "comment" && it.body)
+    const header = [
+      post.title ? `# ${post.title}` : "",
+      [
+        post.communityName || (m[1] ? `r/${m[1]}` : ""),
+        post.username ? `u/${post.username}` : "",
+        Number.isFinite(post.upVotes) ? `${post.upVotes} upvotes` : "",
+        post.createdAt ? String(post.createdAt).slice(0, 10) : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      post.url || "",
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+    const commentBlock = comments
+      .map(
+        (c) =>
+          `**u/${c.username || "unknown"}**${Number.isFinite(c.upVotes) ? ` · ${c.upVotes} points` : ""}\n\n${c.body}`,
+      )
+      .join("\n\n---\n\n")
+    const content = [
+      `[retrieved via Apify reddit-scraper-lite: ${items.length} results, ~$${(items.length * APIFY_USD_PER_RESULT).toFixed(3)}]`,
+      header,
+      post.body,
+      comments.length
+        ? `## Comments (${comments.length}${Number.isFinite(post.numberOfComments) ? ` of ${post.numberOfComments}` : ""})\n\n${commentBlock}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+    return { ok: true, items: items.length, content, ms: Date.now() - t0 }
+  } catch (error) {
+    return { ok: false, reason: `apify: ${String(error).slice(0, 120)}` }
+  }
+}
+
 // ---------------------------------------------------------------- GitHub algebra
 
 const GH_API = "https://api.github.com"
@@ -560,11 +652,18 @@ async function fetchChain(input, signal) {
 
   if (special === "reddit") {
     // Reddit 403s everything since the 2026 lockdown: L0, L1 AND Exa
-    // /contents (SOURCE_NOT_AVAILABLE — verified repeatedly). BUT Exa's
-    // SEARCH index still holds cached post text, surfaced by the keyless
-    // MCP endpoint AND the keyed /search (category "reddit"). So: exact-URL
-    // contents first (works if Exa re-permits later), then a cache-extraction
-    // fallback that locates the thread in /search results.
+    // /contents (SOURCE_NOT_AVAILABLE — verified repeatedly). Preferred:
+    // Apify reddit-scraper-lite (full thread + comments, pay-per-result,
+    // free-plan credits). Fallbacks: exact-URL Exa /contents (works if Exa
+    // re-permits later), then the MCP search-cache extraction.
+    const apify = await redditViaApify(url, budget.l1 + budget.l2, signal)
+    note("apify", apify.ok, { ms: apify.ms, items: apify.items, reason: apify.reason })
+    if (apify.ok) {
+      return {
+        content: apify.content.slice(0, MAX_CHARS),
+        metadata: { layer: "apify", finalUrl: url, items: apify.items },
+      }
+    }
     const exa = await fetchExa(url, budget.l2, signal, maxChars)
     note("exa-reddit", exa.ok, { ms: exa.ms, reason: exa.reason })
     if (exa.ok) {
