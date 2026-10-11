@@ -1,0 +1,595 @@
+// webfetch-ai — layered web fetching for OpenCode (v2.0.26).
+//
+// Registers a tool named `webfetch` that REPLACES the built-in (verified:
+// user plugins activate after internal tools; Editor.add is Map.set).
+//
+// Chain:
+//   special paths  → GitHub URL algebra (raw/API, no auth) | Reddit → Exa
+//   L0 plain fetch → deterministic quality gate (no LLM in the loop)
+//   L1 playwright-ai container (stealth chromium render, local :8899)
+//   L2 Exa /contents ($1/1k pages, free-tier credits; live crawl)
+//
+// Diagnostics: JSONL per-attempt log ~/.local/share/opencode/webfetch-cycle.log
+// Env overrides: WEBFETCH_PLAYWRIGHT_URL, WEBFETCH_LOG_FILE, WEBFETCH_EXA_MAX_PAGES
+//
+// Zero npm imports at module top: node-html-markdown is loaded lazily via
+// createRequire(../node_modules) so a missing vendor tree degrades to text
+// instead of killing the whole plugin.
+
+import { appendFileSync, mkdirSync } from "node:fs"
+import { createRequire } from "node:module"
+import { homedir } from "node:os"
+import path from "node:path"
+
+// ---------------------------------------------------------------- constants
+
+const HOME = homedir()
+const LOG_FILE = process.env.WEBFETCH_LOG_FILE || path.join(HOME, ".local/share/opencode/webfetch-cycle.log")
+const PLAYWRIGHT_URL = process.env.WEBFETCH_PLAYWRIGHT_URL || "http://127.0.0.1:8899/fetch"
+const EXA_CONTENTS_URL = "https://api.exa.ai/contents"
+const MAX_CHARS = 400_000
+const MIN_TEXT_HTML = 300
+const MIN_TEXT_PLAIN = 50
+
+// Chrome-family UA without any bot tell (plain fetch layer only; L1 has its own).
+const CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// deterministic challenge/bot-wall markers, checked on the first 4KB of body text
+const CHALLENGE_MARKERS = [
+  "just a moment",
+  "attention required",
+  "cf-chl",
+  "checking your browser",
+  "checking if the site connection is secure",
+  "enable javascript and cookies to continue",
+  "datadome",
+  "incapsula",
+  "px-captcha",
+  "captcha-delivery",
+  "perimeterx",
+  "request unsuccessful. incapsula",
+  "verify you are a human",
+  "access denied",
+]
+
+// ---------------------------------------------------------------- diagnostics
+
+function fileLog(entry) {
+  try {
+    mkdirSync(path.dirname(LOG_FILE), { recursive: true })
+    appendFileSync(LOG_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n")
+  } catch {
+    /* diagnostics must never break the fetch */
+  }
+}
+
+// ---------------------------------------------------------------- html utils
+
+const SKIP_TAGS = new Set([
+  "script", "style", "noscript", "template", "iframe", "object", "embed",
+  "svg", "canvas", "link", "meta", "head",
+])
+
+function stripHtmlToText(html) {
+  let out = ""
+  let skipping = 0
+  let i = 0
+  const n = html.length
+  while (i < n) {
+    if (html[i] === "<") {
+      const close = html.indexOf(">", i)
+      if (close === -1) break
+      const tag = html.slice(i + 1, close).trim().toLowerCase()
+      if (tag.startsWith("/")) {
+        const name = tag.slice(1).split(/\s/)[0]
+        if (SKIP_TAGS.has(name)) skipping = Math.max(0, skipping - 1)
+      } else if (!tag.startsWith("!") && !tag.endsWith("/")) {
+        const name = tag.split(/\s/)[0]
+        if (SKIP_TAGS.has(name)) skipping++
+        // block-level boundaries become whitespace so words don't fuse
+        if (/^(p|div|br|li|tr|h[1-6]|section|article|blockquote|pre|table)$/.test(name)) out += "\n"
+      }
+      i = close + 1
+      continue
+    }
+    if (skipping === 0) out += html[i]
+    i++
+  }
+  return out
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+}
+
+/** markdown converter, lazily bound from the vendored tree; null = unavailable */
+let nhm = undefined
+function getConverter() {
+  if (nhm !== undefined) return nhm
+  try {
+    const req = createRequire(path.join(HOME, ".config/opencode/plugins/webfetch-ai.ts"))
+    const mod = req("node-html-markdown")
+    nhm = mod.NodeHtmlMarkdown || mod.default?.NodeHtmlMarkdown || mod.default || mod
+  } catch (error) {
+    fileLog({ event: "converter_unavailable", error: String(error).slice(0, 160) })
+    nhm = null
+  }
+  return nhm
+}
+
+function htmlToMarkdown(html) {
+  const conv = getConverter()
+  if (conv) {
+    try {
+      return conv.translate(html, { bulletMarker: "-" })
+    } catch (error) {
+      fileLog({ event: "converter_error", error: String(error).slice(0, 160) })
+    }
+  }
+  return null
+}
+
+// ---------------------------------------------------------------- http helper
+
+async function timedFetch(url, init, ms, outerSignal) {
+  const signals = [AbortSignal.timeout(ms)]
+  if (outerSignal) signals.push(outerSignal)
+  const signal = signals.length === 1 ? signals[0] : AbortSignal.any(signals)
+  return fetch(url, { ...init, signal, redirect: "follow" })
+}
+
+// ---------------------------------------------------------------- L0 gate
+
+function classifyBody(contentType, body) {
+  const ct = (contentType || "").toLowerCase()
+  const head = body.slice(0, 4096).toLowerCase()
+  const challenge = CHALLENGE_MARKERS.some((m) => head.includes(m))
+  const isHtml = ct.includes("text/html") || ct.includes("application/xhtml")
+  const isPdf = ct.includes("application/pdf") || head.startsWith("%pdf-")
+  const textual =
+    ct.includes("text/") ||
+    ct.includes("application/json") ||
+    ct.includes("application/xml") ||
+    ct.includes("javascript") ||
+    ct === "" && !isPdf
+  return { ct, isHtml, isPdf, textual, challenge }
+}
+
+function gateL0(status, contentType, body, elapsedMs) {
+  if (status === 404 || status === 410) return { ok: false, terminal: true, reason: `http ${status} not found` }
+  if (status >= 400) return { ok: false, reason: `http ${status}` }
+  const k = classifyBody(contentType, body)
+  if (k.isPdf) return { ok: false, reason: "pdf (needs L2)", pdf: true }
+  if (!k.textual) return { ok: false, reason: `non-textual mime: ${k.ct || "unknown"}` }
+  if (k.challenge) return { ok: false, reason: "challenge/bot-wall markers" }
+  const text = k.isHtml ? stripHtmlToText(body) : body
+  const min = k.isHtml ? MIN_TEXT_HTML : MIN_TEXT_PLAIN
+  if (text.length < min) return { ok: false, reason: `visible text ${text.length} < ${min}` }
+  if (k.isHtml && body.length > 20_000) {
+    const ratio = text.length / body.length
+    if (ratio < 0.02) return { ok: false, reason: `text/markup ratio ${(ratio * 100).toFixed(1)}% < 2%` }
+  }
+  return { ok: true, isHtml: k.isHtml, textLen: text.length, elapsedMs }
+}
+
+// ---------------------------------------------------------------- L0 fetch
+
+async function fetchPlain(url, budgetMs, outerSignal) {
+  const t0 = Date.now()
+  const res = await timedFetch(
+    url,
+    {
+      headers: {
+        "user-agent": CHROME_UA,
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/*;q=0.8,*/*;q=0.5",
+        "accept-language": "en-US,en;q=0.9",
+      },
+    },
+    budgetMs,
+    outerSignal,
+  )
+  const contentType = res.headers.get("content-type") || ""
+  const cfMitigated = res.headers.get("cf-mitigated") || ""
+  if (cfMitigated === "challenge") {
+    return { verdict: { ok: false, reason: "cf-mitigated challenge header" }, status: res.status, contentType }
+  }
+  const body = await res.text()
+  const verdict = gateL0(res.status, contentType, body, Date.now() - t0)
+  return { verdict, status: res.status, contentType, body }
+}
+
+// ---------------------------------------------------------------- L1 fetch
+
+async function fetchPlaywright(url, budgetMs, outerSignal) {
+  const t0 = Date.now()
+  const res = await timedFetch(
+    PLAYWRIGHT_URL,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url, timeout_ms: Math.min(60_000, Math.round(budgetMs * 1000)) }),
+    },
+    Math.round(budgetMs * 1000) + 5_000,
+    outerSignal,
+  )
+  const data = await res.json()
+  if (!res.ok) {
+    return { ok: false, reason: `playwright-ai ${res.status}: ${String(data?.error || "").slice(0, 120)}` }
+  }
+  return { ...data, ms: Date.now() - t0 }
+}
+
+// ---------------------------------------------------------------- L2 Exa
+
+async function fetchExa(url, budgetMs, outerSignal, maxChars) {
+  const key = process.env.EXA_API_KEY
+  if (!key) return { ok: false, reason: "no EXA_API_KEY" }
+  const t0 = Date.now()
+  const res = await timedFetch(
+    EXA_CONTENTS_URL,
+    {
+      method: "POST",
+      headers: { "x-api-key": key, "content-type": "application/json" },
+      body: JSON.stringify({
+        urls: [url],
+        text: { maxCharacters: Math.min(maxChars, 100_000) },
+        maxAgeHours: 24, // force live crawl when cache is older; fresh cache still serves fast
+        livecrawlTimeout: Math.min(25_000, Math.max(5_000, Math.round(budgetMs * 1000))),
+      }),
+    },
+    Math.round(budgetMs * 1000) + 5_000,
+    outerSignal,
+  )
+  const data = await res.json().catch(() => null)
+  if (!res.ok) {
+    const detail = data ? JSON.stringify(data).slice(0, 160) : res.statusText
+    return { ok: false, reason: `exa ${res.status}: ${detail}` }
+  }
+  const first = data?.results?.[0]
+  if (!first || !first.text) return { ok: false, reason: "exa: empty results" }
+  return {
+    ok: true,
+    title: first.title || "",
+    text: first.text,
+    publishedDate: first.publishedDate || null,
+    ms: Date.now() - t0,
+  }
+}
+
+// ---------------------------------------------------------------- GitHub algebra
+
+const GH_API = "https://api.github.com"
+
+function ghParse(url) {
+  let u
+  try {
+    u = new URL(url)
+  } catch {
+    return null
+  }
+  if (u.hostname !== "github.com" && u.hostname !== "raw.githubusercontent.com" && u.hostname !== "gist.github.com")
+    return null
+  const seg = u.pathname.split("/").filter(Boolean)
+  if (u.hostname === "raw.githubusercontent.com") {
+    // o/r/branch/path... — already raw
+    return { kind: "raw-direct", url }
+  }
+  if (u.hostname === "gist.github.com") return { kind: "fallback" } // gists render fine; skip algebra
+  const [owner, repo, ...rest] = seg
+  if (!owner || !repo) return { kind: "fallback" }
+  if (rest.length === 0) return { kind: "repo", owner, repo }
+  const [a, b, ...tail] = rest
+  if ((a === "blob" || a === "tree") && b) {
+    const p = tail.join("/")
+    return { kind: a === "blob" ? "blob" : "tree", owner, repo, ref: b, path: p }
+  }
+  if ((a === "issues" || a === "pull") && b && /^\d+$/.test(b)) return { kind: "issue", owner, repo, num: b, isPr: a === "pull" }
+  if (a === "releases" || a === "tags" || a === "commits") return { kind: "fallback" } // server-rendered OK
+  return { kind: "fallback" }
+}
+
+async function ghJson(pathname, budgetMs, outerSignal) {
+  const res = await timedFetch(
+    `${GH_API}${pathname}`,
+    {
+      headers: {
+        accept: "application/vnd.github+json",
+        "user-agent": CHROME_UA,
+        ...(process.env.GITHUB_TOKEN ? { authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
+      },
+    },
+    budgetMs,
+    outerSignal,
+  )
+  if (!res.ok) throw new Error(`gh api ${res.status} ${pathname}`)
+  return res.json()
+}
+
+async function fetchGitHub(parsed, budgetMs, outerSignal) {
+  const slice = (ms) => Math.max(3_000, Math.round(budgetMs * 0.4))
+  if (parsed.kind === "raw-direct" || parsed.kind === "fallback") return null // caller falls through to chain
+  try {
+    if (parsed.kind === "blob") {
+      const raw = `https://raw.githubusercontent.com/${parsed.owner}/${parsed.repo}/${parsed.ref}/${parsed.path}`
+      const t0 = Date.now()
+      const res = await timedFetch(raw, { headers: { "user-agent": CHROME_UA } }, slice(), outerSignal)
+      if (!res.ok) throw new Error(`raw ${res.status}`)
+      const body = await res.text()
+      return {
+        layer: "github",
+        content: body.slice(0, MAX_CHARS) + (body.length > MAX_CHARS ? "\n\n[truncated]" : ""),
+        meta: { kind: "blob", bytes: body.length, ms: Date.now() - t0 },
+      }
+    }
+    if (parsed.kind === "tree") {
+      const data = await ghJson(
+        `/repos/${parsed.owner}/${parsed.repo}/contents/${parsed.path}?ref=${encodeURIComponent(parsed.ref)}`,
+        slice(),
+        outerSignal,
+      )
+      const lines = (Array.isArray(data) ? data : [data]).map((e) => `- ${e.type === "dir" ? "[dir] " : ""}${e.name} (${e.size}B)`)
+      return {
+        layer: "github",
+        content: `Directory /${parsed.path} @ ${parsed.ref}:\n\n${lines.join("\n")}`,
+        meta: { kind: "tree", entries: lines.length },
+      }
+    }
+    if (parsed.kind === "repo") {
+      const meta = await ghJson(`/repos/${parsed.owner}/${parsed.repo}`, slice(), outerSignal)
+      const readmeRes = await timedFetch(
+        `${GH_API}/repos/${parsed.owner}/${parsed.repo}/readme`,
+        {
+          headers: {
+            accept: "application/vnd.github.raw",
+            "user-agent": CHROME_UA,
+            ...(process.env.GITHUB_TOKEN ? { authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
+          },
+        },
+        slice(),
+        outerSignal,
+      )
+      const readme = readmeRes.ok ? await readmeRes.text() : "(readme fetch failed)"
+      const head =
+        `# ${meta.full_name}\n\n${meta.description || "(no description)"}\n\n` +
+        `stars: ${meta.stargazers_count} | forks: ${meta.forks_count} | language: ${meta.language} | default branch: ${meta.default_branch}\n` +
+        (meta.topics?.length ? `topics: ${meta.topics.join(", ")}\n` : "")
+      return {
+        layer: "github",
+        content: `${head}\n## README\n\n${readme.slice(0, MAX_CHARS)}`,
+        meta: { kind: "repo", stars: meta.stargazers_count },
+      }
+    }
+    if (parsed.kind === "issue") {
+      const issue = await ghJson(`/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.num}`, slice(), outerSignal)
+      const comments = await ghJson(
+        `/repos/${parsed.owner}/${parsed.repo}/issues/${parsed.num}/comments?per_page=30`,
+        slice(),
+        outerSignal,
+      ).catch(() => [])
+      const body =
+        `# ${issue.title} (${issue.state})\n\n` +
+        `${parsed.isPr ? "pull request" : "issue"} #${issue.number} by ${issue.user?.login || "?"} — created ${issue.created_at}\n\n` +
+        `${issue.body || "(no body)"}\n`
+      const thread = (comments || [])
+        .map((c) => `---\n${c.user?.login || "?"} at ${c.created_at}:\n\n${c.body || ""}`)
+        .join("\n\n")
+      return {
+        layer: "github",
+        content: `${body}${comments?.length ? `\n## Comments (${comments.length})\n\n${thread}` : ""}`.slice(0, MAX_CHARS),
+        meta: { kind: parsed.isPr ? "pr" : "issue", comments: comments?.length || 0 },
+      }
+    }
+  } catch (error) {
+    fileLog({ event: "github_fail", kind: parsed.kind, error: String(error).slice(0, 160) })
+    return null // fall through to the general chain
+  }
+  return null
+}
+
+// ---------------------------------------------------------------- router
+
+function route(url) {
+  let u
+  try {
+    u = new URL(url)
+  } catch {
+    return { special: null }
+  }
+  const host = u.hostname.replace(/^www\./, "")
+  if (host === "github.com" || host === "raw.githubusercontent.com" || host === "gist.github.com") {
+    return { special: "github" }
+  }
+  if (host === "reddit.com" || host.endsWith(".reddit.com")) return { special: "reddit" }
+  return { special: null }
+}
+
+// ---------------------------------------------------------------- chain
+
+function budgetFor(totalSec) {
+  const totalMs = totalSec * 1000
+  return {
+    l0: Math.max(4_000, Math.round(totalMs * 0.15)),
+    l1: Math.max(12_000, Math.round(totalMs * 0.4)),
+    l2: Math.max(10_000, Math.round(totalMs * 0.35)),
+  }
+}
+
+async function fetchChain(input, signal) {
+  const url = input.url
+  const format = input.format || "markdown"
+  const totalSec = Math.min(120, Math.max(5, Number(input.timeout) || 60))
+  const budget = budgetFor(totalSec)
+  const maxChars = Number(process.env.WEBFETCH_EXA_MAX_CHARS) || MAX_CHARS
+
+  const { special } = route(url)
+  const attempts = []
+  const note = (layer, ok, extra = {}) => {
+    attempts.push({ layer, ok, ...extra })
+    fileLog({ event: "attempt", url, layer, ok, ...extra })
+  }
+
+  // ---- special paths ------------------------------------------------------
+  if (special === "github") {
+    const parsed = ghParse(url)
+    if (parsed && parsed.kind !== "raw-direct" && parsed.kind !== "fallback") {
+      const result = await fetchGitHub(parsed, budget.l0 + budget.l1, signal)
+      if (result) {
+        note("github", true, { kind: result.meta.kind, ms: result.meta.ms })
+        return { content: result.content, metadata: { layer: result.layer, ...result.meta } }
+      }
+      note("github", false, { note: "algebra failed; falling through to chain" })
+    }
+  }
+
+  if (special === "reddit") {
+    const exa = await fetchExa(url, budget.l2, signal, maxChars)
+    note("exa-reddit", exa.ok, { ms: exa.ms, reason: exa.reason })
+    if (exa.ok) {
+      return {
+        content: `${exa.title ? `${exa.title}\n\n` : ""}${exa.text}`.slice(0, MAX_CHARS),
+        metadata: { layer: "exa", finalUrl: url },
+      }
+    }
+    // fall through to general chain as a last resort
+  }
+
+  // ---- L0 -----------------------------------------------------------------
+  let l0
+  try {
+    l0 = await fetchPlain(url, budget.l0, signal)
+  } catch (error) {
+    l0 = {
+      verdict: { ok: false, reason: signal?.aborted ? "aborted" : `transport: ${String(error).slice(0, 120)}` },
+      status: 0,
+      contentType: "",
+      body: "",
+    }
+  }
+  note("L0", !!l0.verdict.ok, { status: l0.status, reason: l0.verdict.reason, ms: l0.verdict.elapsedMs })
+
+  if (l0.verdict.terminal) {
+    return {
+      content: `[webfetch-ai] HTTP ${l0.status} (not found): ${url}\nThe resource does not exist; no fallback attempted.`,
+      metadata: { layer: "L0", status: l0.status, terminal: true },
+    }
+  }
+
+  if (l0.verdict.ok) {
+    const finalText = format === "html" ? l0.body : format === "text" ? stripHtmlToText(l0.body) : null
+    if (format !== "markdown") {
+      return {
+        content: (finalText || "").slice(0, MAX_CHARS),
+        metadata: { layer: "L0", contentType: l0.contentType, format },
+      }
+    }
+    const md = htmlToMarkdown(l0.body)
+    if (md !== null) {
+      return { content: md.slice(0, MAX_CHARS), metadata: { layer: "L0", contentType: l0.contentType } }
+    }
+    // converter unavailable: degrade to text rather than burning L1 for cosmetics
+    return {
+      content: stripHtmlToText(l0.body).slice(0, MAX_CHARS),
+      metadata: { layer: "L0", contentType: l0.contentType, format: "text (converter unavailable)" },
+    }
+  }
+
+  if (l0.verdict.pdf) {
+    const exa = await fetchExa(url, budget.l2, signal, maxChars)
+    note("L2-pdf", exa.ok, { ms: exa.ms, reason: exa.reason })
+    if (exa.ok) {
+      return { content: `${exa.title ? `${exa.title}\n\n` : ""}${exa.text}`.slice(0, MAX_CHARS), metadata: { layer: "L2", kind: "pdf" } }
+    }
+    throw new Error(`Unable to fetch PDF ${url}: L2 Exa failed (${exa.reason})`)
+  }
+
+  // ---- L1 -----------------------------------------------------------------
+  let l1
+  try {
+    l1 = await fetchPlaywright(url, budget.l1, signal)
+  } catch (error) {
+    l1 = { ok: false, reason: signal?.aborted ? "aborted" : `playwright-ai unreachable: ${String(error).slice(0, 120)}` }
+  }
+  note("L1", !!l1.ok, { status: l1.status, ms: l1.ms, reason: l1.reason, textLen: l1.textLen })
+
+  const l1Usable =
+    l1.ok &&
+    l1.status < 400 &&
+    (l1.textLen || 0) >= MIN_TEXT_HTML &&
+    !CHALLENGE_MARKERS.some((m) => (l1.markdown || "").slice(0, 4096).toLowerCase().includes(m))
+
+  if (l1Usable) {
+    if (l1.status === 404 || l1.status === 410) {
+      return {
+        content: `[webfetch-ai] HTTP ${l1.status} (not found): ${url}`,
+        metadata: { layer: "L1", status: l1.status, terminal: true },
+      }
+    }
+    let content = l1.markdown
+    if (format === "text") content = stripHtmlToText(content) // markdown → plain-ish text
+    if (format === "html") content = `<!-- rendered by playwright-ai; original HTML not retained -->\n${content}`
+    return {
+      content: content.slice(0, MAX_CHARS),
+      metadata: { layer: "L1", status: l1.status, finalUrl: l1.finalUrl, title: l1.title, ms: l1.ms },
+    }
+  }
+
+  // ---- L2 -----------------------------------------------------------------
+  const exa = await fetchExa(url, budget.l2, signal, maxChars)
+  note("L2", exa.ok, { ms: exa.ms, reason: exa.reason })
+  if (exa.ok) {
+    return {
+      content: `${exa.title ? `${exa.title}\n\n` : ""}${exa.text}`.slice(0, MAX_CHARS),
+      metadata: { layer: "L2", title: exa.title, publishedDate: exa.publishedDate, ms: exa.ms },
+    }
+  }
+
+  const tried = attempts.map((a) => `${a.layer}${a.ok ? "✓" : `✗(${a.reason || ""})`}`).join(" → ")
+  throw new Error(`Unable to fetch ${url}. Attempts: ${tried}. Last error: ${l1.reason || l0.verdict.reason}`)
+}
+
+// ---------------------------------------------------------------- plugin
+
+export const WebfetchAiPlugin = {
+  id: "local.webfetch-ai",
+  async setup(context) {
+    context.tool.transform((editor) => {
+      editor.add({
+        name: "webfetch",
+        description:
+          "Fetch content from an HTTP or HTTPS URL and return it as markdown (default), text, or HTML. " +
+          "Layered resilient fetching: plain HTTP first; JavaScript-rendered, PDF, and anti-bot pages escalate " +
+          "to a headless-Chromium service, then to the Exa extract API as a last resort. GitHub and Reddit URLs " +
+          "use dedicated paths. Read-only. Large results are truncated at ~400KB. Default timeout 60s, max 120s.",
+        input: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "The HTTP or HTTPS URL to fetch" },
+            format: {
+              type: "string",
+              enum: ["text", "markdown", "html"],
+              description: "The format to return. Defaults to markdown (html passes through raw on L0; L1 returns rendered markdown).",
+            },
+            timeout: {
+              type: "number",
+              description: "Optional total time budget in seconds (1-120). Default 60.",
+            },
+          },
+          required: ["url"],
+        },
+        options: { codemode: false },
+        execute: async (input, ctx) => {
+          const content = await fetchChain(input || {}, ctx?.signal)
+          return { content: content.content, metadata: content.metadata }
+        },
+      })
+    })
+  },
+}
+
+export default WebfetchAiPlugin
