@@ -1,14 +1,13 @@
 # webfetch-ai
 
-> **⚠️ EXPERIMENTAL — not yet human reviewed.**
-> This project was built end-to-end by an AI coding agent (OpenCode + GLM)
-> under human direction. No human has yet read the code line-by-line. It is
-> public because it works and is live-tested, but the author does not stand
-> over it yet. Read before you trust it with anything that matters.
+> **⚠️ EXPERIMENTAL.**
+> Built by an AI agent under human direction; line-by-line human review is
+> still pending. Feedback and review are welcome.
 
-> Moreover: it uses interfaces discovered by reading the source code of
-> OpenCode 2.0.26. There is no guarantee the plugin will cleanly install
-> and work in any other version.
+> Built and validated against OpenCode **2.0.26**. The plugin API is not
+> version-stable, and the shipped code appears to differ from the published
+> plugin docs. Please check compatibility before applying to another 2.x
+> version - agentic check will likely do fine. 1.x likely won't work.
 
 Layered web fetching for [OpenCode](https://opencode.ai), replacing the
 built-in `webfetch` tool with a resilient chain: plain HTTP first, then a
