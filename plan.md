@@ -153,3 +153,21 @@ scratch in /srv/ssd/tmp/opencode/.
 Final deploy check (03:16 UTC): the deployed
 ~/.config/opencode/plugins/webfetch-ai.ts passes a fresh L0 + github-lane
 probe against the live service. Overnight arc complete.
+
+---
+## Post-report corrections (2026-10-11 morning, user follow-up)
+
+1. **CRITICAL L1 bug found & fixed** (`fa617c6`): fetchPlaywright never set
+   `ok:true` on success — `l1.ok` was always `undefined`, so EVERY L1
+   success was discarded and L2 re-fetched it (paying Exa for content we
+   already had). framer.com now resolves at L1 (12.1KB rendered markdown,
+   7.7s). User's question "did we even test L1 does something?" — the
+   container worked (health + direct curl), but the chain never USED it.
+2. **Reddit partially un-dead** (`aa67072`): keyed /search category=reddit
+   does NOT return reddit originals (index gutted — probed with several
+   query shapes), BUT the keyless mcp.exa.ai endpoint DOES surface exact
+   threads with title/author/highlights. Added a cache-extraction step:
+   /contents (future-proof) -> MCP search-cache with id+slug URL matching
+   -> general chain. Verified on r/Rag thread 1f9281b: real cached text,
+   zero metered cost. Highlights are truncated excerpts, not full threads
+   — partial win, honest label in the output header.
