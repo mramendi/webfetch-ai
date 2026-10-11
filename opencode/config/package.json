@@ -1,8 +1,0 @@
-{
-  "name": "opencode-config",
-  "private": true,
-  "description": "npm deps for local OpenCode plugins. Populated by deploy.sh from the pinned vendor tree (opencode/plugins/vendor flat-mapped into node_modules/). No npm registry access needed at deploy time.",
-  "dependencies": {
-    "node-html-markdown": "2.0.0"
-  }
-}
