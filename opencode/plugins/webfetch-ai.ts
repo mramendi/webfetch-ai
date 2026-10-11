@@ -229,7 +229,11 @@ async function fetchPlaywright(url, budgetMs, outerSignal) {
   if (!res.ok) {
     return { ok: false, reason: `playwright-ai ${res.status}: ${String(data?.error || "").slice(0, 120)}` }
   }
-  return { ...data, ms: Date.now() - t0 }
+  // The container returns {status, finalUrl, title, markdown, textLen, ms} —
+  // it has no `ok` field; a 200 from the service IS the success signal.
+  // (Missing this made every L1 success invisible: gate read l1.ok ===
+  // undefined → always-false → successes were discarded and L2 re-fetched.)
+  return { ok: true, ...data, ms: Date.now() - t0 }
 }
 
 // ---------------------------------------------------------------- L2 Exa
