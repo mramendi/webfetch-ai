@@ -6,17 +6,34 @@ Research-grade fetching for OpenCode: the built-in `webfetch` is a plain HTTPS
 GET with an announced-bot UA (`OpenCode-User/1.0`) — friendly sites only.
 Replace it (shadow by name) with a layered chain that escalates deterministically.
 
-## Integration mechanism (verified)
+## Integration mechanism (VERIFIED empirically, 2026-10-11)
 
-Custom tools shadow built-ins by name (docs: "If a custom tool uses the same
-name as a built-in tool, the custom tool takes precedence"; v2.0.26 source:
-built-ins register via `ctx.tool.transform(editor => editor.add({name…}))`).
-Deploy target: `~/.config/opencode/tools/webfetch.ts` (global, all agents).
-Keep built-in arg/output contract: args `{url, format?: text|markdown|html
-(default markdown), timeout?: ≤120s}`; output `{url, contentType, format,
-output}`. Permission config `"webfetch": "allow"` applies by tool name.
-**Build step 1 = marker test proving precedence empirically.** Fallback if it
-loses: plugin `tool: { webfetch: … }` registration.
+**v2.0.26 has NO tools/-directory loader** — `custom-tools.mdx` in the docs
+tree describes a later version (docs drift). The `tools/` route is dead at
+this tag.
+
+**Verified plugin route** (marker test passed; standalone run returned
+`PLUGIN-SHADOW-OK`):
+- Plugin file `~/.config/opencode/plugins/webfetch-ai.ts`, shape
+  `{id, async setup(context)}` (search-cycle.ts is the working template —
+  default export, zero npm imports).
+- Inside setup: `context.tool.transform(editor => editor.add({name:
+  "webfetch", input: <JSON Schema>, description, execute}))`.
+- `Editor.add` is `Map.set` — same-name OVERWRITES silently; user plugins
+  activate after internal-pre tools, so our add wins (supervisor.ts boot
+  order + schema/tool.ts Info shape verified in source).
+- `input` accepts plain JSON Schema (ValueSchema union: Codec |
+  StandardSchema | JsonSchema). `execute(input, ctx)` returns
+  `{content: string}` (schema/tool.ts Result.content allows string).
+- Options `{codemode: false}` to match built-in behavior; Code Mode catalog
+  picks up the custom tool too (observed: `tools.webfetch` carried the
+  marker description).
+- Permission config `"webfetch": "allow"` matches by tool name → unchanged.
+- **Hot-reload applies live**: plugins/ dir is watched; deploy/unload takes
+  effect for all sessions immediately (observed in this session). So:
+  validate outside the service first; never leave a broken/beta shadow live.
+- Keep built-in arg/output contract: `{url, format?: text|markdown|html
+  (default markdown), timeout?: ≤120s}`; content string output.
 
 ## Chain
 
