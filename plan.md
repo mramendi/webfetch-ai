@@ -121,3 +121,31 @@ status, reason) — search-cycle.log pattern.
 No sudo, no Caddy changes, legacy stack untouched, secrets only via
 load-secrets.sh, config repo committed+pushed as deployment record, test
 scratch in /srv/ssd/tmp/opencode/.
+
+---
+## Build deviations & discoveries (2026-10-11, post-build addendum)
+
+1. **Integration**: verified plugin route (see top section). Deployed file:
+   `~/.config/opencode/plugins/webfetch-ai.ts`. Verified in a real LLM
+   session (standalone run: github layer served repo request; JSONL log).
+2. **node-html-markdown vendored** (2.0.0 + 14 transitive pkgs, 1.5MB):
+   no node/npm/bun on the box, so no npm install path. `deploy-vendor.sh`
+   flattens vendor/<pkg>/<ver>/ -> ~/.config/opencode/node_modules/<pkg>/
+   (standard layout; nested version dirs FAIL node CJS resolution — tested).
+   Plugin loads NHM lazily via createRequire; missing tree degrades to text.
+3. **L0 gate floor**: MIN_TEXT_HTML 300 -> 120. example.com has 156 visible
+   chars; the 300 floor pushed healthy small pages to L2.
+4. **Exa /contents params** (live-probed): `livecrawl` is deprecated and
+   mutually exclusive with `maxAgeHours` — use `maxAgeHours: 24` only.
+5. **playwright-ai**: playwright pkg must be installed IN the image (ESM
+   can't resolve the image's global install); version must match the image
+   tag (1.64.0) with PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1. `browser.userAgent()`
+   was removed — UA derived from browser.version(). seccomp=unconfined +
+   shm 1g works under rootless podman (no custom seccomp profile needed).
+6. **External reality (2026)**: reddit now 403s L0, L1 AND Exa
+   (SOURCE_NOT_AVAILABLE) — the reddit→Exa shortcut can't succeed today;
+   hook point remains for an OAuth path. nowsecure.nl (bot test site)
+   legitimately fails all gates — its entire content is 33 chars.
+7. **Test matrix** (live): friendly/spa/notfound/gh_repo/gh_blob/gh_issue/pdf
+   pass; reddit + bot-wall documented as expected-fail. Latencies: L0
+   10-80ms, github 10-460ms, L1 0.9-1.5s, L2 0.2-0.3s.
