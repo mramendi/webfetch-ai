@@ -275,6 +275,104 @@ async function fetchExa(url, budgetMs, outerSignal, maxChars) {
   }
 }
 
+// ---------------------------------------------------------------- Reddit via Exa search cache
+
+/**
+ * Reddit direct fetch is dead (2026 lockdown), and keyed /contents returns
+ * SOURCE_NOT_AVAILABLE for reddit URLs — but Exa still surfaces indexed
+ * post text with highlights via the KEYLESS MCP search endpoint (mcp.exa.ai,
+ * the same one search-cycle uses). Keyed /search with category "reddit" was
+ * probed and does NOT return the reddit originals (its reddit index looks
+ * gutted); the MCP endpoint demonstrably does. So: exact-URL /contents
+ * first (works if Exa re-permits later), then MCP search-cache extraction.
+ */
+async function redditViaExaSearch(url, budgetMs, outerSignal, maxChars) {
+  const t0 = Date.now()
+
+  // Derive a search query from the URL: /r/<sub>/comments/<id>/<slug>/
+  const m = url.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)(?:\/([^/?]+))?/i)
+  let query
+  if (m) query = [m[3]?.replace(/[-_]+/g, " "), `r/${m[1]}`].filter(Boolean).join(" ")
+  else {
+    const sub = url.match(/reddit\.com\/r\/([^/?]+)/i)?.[1]
+    if (!sub) return { ok: false, reason: "unsupported reddit URL shape" }
+    query = `r/${sub}`
+  }
+
+  try {
+    // keyless MCP — no metered credit, same endpoint search-cycle uses
+    const res = await timedFetch(
+      "https://mcp.exa.ai/mcp",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "web_search_exa", arguments: { query, numResults: 10 } },
+        }),
+      },
+      budgetMs * 1000,
+      outerSignal,
+    )
+    const raw = await res.text()
+    let payload = null
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("data:")) {
+        try {
+          payload = JSON.parse(line.slice(5))
+          break
+        } catch {}
+      }
+    }
+    if (!payload && raw.startsWith("{")) payload = JSON.parse(raw)
+    const text = payload?.result?.content?.find((c) => c.type === "text")?.text || ""
+    if (!text) return { ok: false, reason: "exa mcp: empty response" }
+
+    // parse the blocks and match against the requested URL
+    const wantId = m?.[2]?.toLowerCase()
+    const wantSlug = m?.[3]?.toLowerCase()
+    const blocks = text.split(/\n\n---\n\n/)
+    let best = null
+    let bestScore = 0
+    for (const block of blocks) {
+      const blockUrl = block.match(/^URL:\s*(.+)$/m)?.[1]?.trim()
+      if (!blockUrl) continue
+      const s = blockUrl.toLowerCase()
+      let v = 0
+      if (wantId && s.includes(wantId)) v += 10
+      if (wantSlug && s.includes(wantSlug)) v += 5
+      if (v > bestScore) {
+        bestScore = v
+        best = { blockUrl, block }
+      }
+    }
+    if (!best) return { ok: false, reason: "exa mcp: thread not in search index" }
+
+    // block shape: Title / URL / Published / Author / Highlights
+    const title = best.block.match(/^Title:\s*(.+)$/m)?.[1]?.trim() || ""
+    const author = best.block.match(/^Author:\s*(.+)$/m)?.[1]?.trim() || ""
+    const published = best.block.match(/^Published:\s*(.+)$/m)?.[1]?.trim() || ""
+    const highlights = best.block.match(/^(?:Highlights|Text):\s*\n?([\s\S]*)$/m)?.[1]?.trim() || ""
+    const body = [title && `# ${title}`, author && `by ${author}${published ? ` — ${published}` : ""}`, highlights]
+      .filter(Boolean)
+      .join("\n\n")
+    if (highlights.length < 50) return { ok: false, reason: "exa mcp: matched but highlights too thin" }
+    return {
+      ok: true,
+      matchedUrl: best.blockUrl,
+      content: `[retrieved via Exa search cache (reddit direct is 403-blocked); thread: ${best.blockUrl}]\n\n${body}`,
+      ms: Date.now() - t0,
+    }
+  } catch (error) {
+    return { ok: false, reason: `exa mcp: ${String(error).slice(0, 120)}` }
+  }
+}
+
 // ---------------------------------------------------------------- GitHub algebra
 
 const GH_API = "https://api.github.com"
@@ -461,12 +559,26 @@ async function fetchChain(input, signal) {
   }
 
   if (special === "reddit") {
+    // Reddit 403s everything since the 2026 lockdown: L0, L1 AND Exa
+    // /contents (SOURCE_NOT_AVAILABLE — verified repeatedly). BUT Exa's
+    // SEARCH index still holds cached post text, surfaced by the keyless
+    // MCP endpoint AND the keyed /search (category "reddit"). So: exact-URL
+    // contents first (works if Exa re-permits later), then a cache-extraction
+    // fallback that locates the thread in /search results.
     const exa = await fetchExa(url, budget.l2, signal, maxChars)
     note("exa-reddit", exa.ok, { ms: exa.ms, reason: exa.reason })
     if (exa.ok) {
       return {
         content: `${exa.title ? `${exa.title}\n\n` : ""}${exa.text}`.slice(0, MAX_CHARS),
         metadata: { layer: "exa", finalUrl: url },
+      }
+    }
+    const cached = await redditViaExaSearch(url, budget.l2, signal, maxChars)
+    note("exa-reddit-cached", cached.ok, { ms: cached.ms, reason: cached.reason })
+    if (cached.ok) {
+      return {
+        content: cached.content.slice(0, MAX_CHARS),
+        metadata: { layer: "exa-search", finalUrl: url, matchedUrl: cached.matchedUrl },
       }
     }
     // fall through to general chain as a last resort
