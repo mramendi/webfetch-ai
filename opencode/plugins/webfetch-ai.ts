@@ -287,18 +287,85 @@ async function fetchExa(url, budgetMs, outerSignal, maxChars) {
  * gutted); the MCP endpoint demonstrably does. So: exact-URL /contents
  * first (works if Exa re-permits later), then MCP search-cache extraction.
  */
+// ---------------------------------------------------------------- Reddit URL algebra
+
+/**
+ * Single source of truth for reddit URL shapes (thread / comment / share).
+ *
+ *   thread            /r/<sub>/comments/<id>[/slug]
+ *   comment permalink /r/<sub>/comments/<id>/(<slug>|comment|_)/<commentId>
+ *   share link        /s/<code> or /r/<sub>/s/<code>   (resolved by the actor)
+ *
+ * The literal "comment" or "_" segment is reddit's share-button placeholder
+ * for a missing slug, NOT a slug — treating it as one broke both consumers
+ * (2026-10-12): the Apify lane forwarded /comment/<id>/ verbatim (the actor
+ * then returns only the anchor comment, no post) and the Exa-cache query
+ * became "comment r/<sub>", whose scorer then accepted any /comments/ URL.
+ * Query strings (utm_*, ?context=N) are ignored for classification. Returns
+ * null for non-reddit URLs; kind "other" for subreddit/user/search pages.
+ * Ids keep their original case — reddit base36 ids are case-sensitive;
+ * comparisons lowercase on both sides.
+ */
+function parseRedditShape(url) {
+  let u
+  try {
+    u = new URL(url)
+  } catch {
+    return null
+  }
+  if (!/(^|\.)reddit\.com$/i.test(u.hostname)) return null
+  const path = u.pathname
+  const share = path.match(/^\/(?:r\/[^/]+\/)?s\/([A-Za-z0-9]+)/i)
+  if (share) return { kind: "share", sub: null, threadId: null, slug: null, commentId: null, path }
+  const seg = path.split("/").filter(Boolean)
+  if (seg[0] !== "r" || seg[2]?.toLowerCase() !== "comments" || !seg[3])
+    return { kind: "other", sub: null, threadId: null, slug: null, commentId: null, path }
+  const sub = seg[1]
+  const threadId = seg[3]
+  const extra = seg.slice(4)
+  let slug = extra[0] ?? null
+  let commentId = extra.length >= 2 ? extra[extra.length - 1] : null
+  if (slug && /^(comment|_)$/i.test(slug)) slug = null
+  return { kind: commentId ? "comment" : "thread", sub, threadId, slug, commentId, path }
+}
+
+/**
+ * Pick the Exa search-cache block that really is the requested thread.
+ * HARD RULE: a block is eligible only when its own URL's thread id equals
+ * the requested one — substring scoring alone served a different thread
+ * (the pseudo-slug "comment" is a substring of every /comments/ URL).
+ * Within the matching thread, a slug match breaks ties.
+ */
+function pickExaThreadBlock(blocks, threadId, slug) {
+  let best = null
+  let bestScore = 0
+  for (const block of blocks) {
+    const blockUrl = block.match(/^URL:\s*(.+)$/m)?.[1]?.trim()
+    if (!blockUrl) continue
+    const blockId = blockUrl.match(/\/comments\/([a-z0-9]+)/i)?.[1]?.toLowerCase()
+    const want = threadId?.toLowerCase()
+    if (!want || !blockId || blockId !== want) continue
+    let v = 10
+    if (slug && blockUrl.toLowerCase().includes(slug.toLowerCase())) v += 5
+    if (v > bestScore) {
+      bestScore = v
+      best = { blockUrl, block }
+    }
+  }
+  return best
+}
+
 async function redditViaExaSearch(url, budgetMs, outerSignal, maxChars) {
   const t0 = Date.now()
 
-  // Derive a search query from the URL: /r/<sub>/comments/<id>/<slug>/
-  const m = url.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)(?:\/([^/?]+))?/i)
-  let query
-  if (m) query = [m[3]?.replace(/[-_]+/g, " "), `r/${m[1]}`].filter(Boolean).join(" ")
-  else {
-    const sub = url.match(/reddit\.com\/r\/([^/?]+)/i)?.[1]
-    if (!sub) return { ok: false, reason: "unsupported reddit URL shape" }
-    query = `r/${sub}`
-  }
+  // Search-query derivation via parseRedditShape (its docstring records the
+  // bug this replaces). Subreddit/user/search URLs are not matchable here —
+  // they fall through to the general chain instead of burning an MCP call
+  // that could never be thread-verified.
+  const shape = parseRedditShape(url)
+  if (!shape || (shape.kind !== "thread" && shape.kind !== "comment"))
+    return { ok: false, reason: "exa mcp: only thread/comment URLs are matchable" }
+  const query = [shape.slug?.replace(/[-_]+/g, " "), `r/${shape.sub}`].filter(Boolean).join(" ")
 
   try {
     // keyless MCP — no metered credit, same endpoint search-cycle uses
@@ -334,24 +401,10 @@ async function redditViaExaSearch(url, budgetMs, outerSignal, maxChars) {
     const text = payload?.result?.content?.find((c) => c.type === "text")?.text || ""
     if (!text) return { ok: false, reason: "exa mcp: empty response" }
 
-    // parse the blocks and match against the requested URL
-    const wantId = m?.[2]?.toLowerCase()
-    const wantSlug = m?.[3]?.toLowerCase()
+    // match blocks against the requested thread — pickExaThreadBlock
+    // hard-rejects any block whose thread id differs from the requested one
     const blocks = text.split(/\n\n---\n\n/)
-    let best = null
-    let bestScore = 0
-    for (const block of blocks) {
-      const blockUrl = block.match(/^URL:\s*(.+)$/m)?.[1]?.trim()
-      if (!blockUrl) continue
-      const s = blockUrl.toLowerCase()
-      let v = 0
-      if (wantId && s.includes(wantId)) v += 10
-      if (wantSlug && s.includes(wantSlug)) v += 5
-      if (v > bestScore) {
-        bestScore = v
-        best = { blockUrl, block }
-      }
-    }
+    const best = pickExaThreadBlock(blocks, shape.threadId, shape.slug)
     if (!best) return { ok: false, reason: "exa mcp: thread not in search index" }
 
     // block shape: Title / URL / Published / Author / Highlights
@@ -385,6 +438,13 @@ async function redditViaExaSearch(url, budgetMs, outerSignal, maxChars) {
  * APIFY_MAX_COMMENTS, default 15) × $0.0034/result ≈ $0.05/fetch ceiling;
  * the free plan covers roughly 100 capped fetches/month. Note the comchat
  * search-only actor was rejected for this lane: it cannot fetch by URL.
+ *
+ * Comment permalinks (/comments/<id>/(slug|comment|_)/<commentId>) are
+ * anchored: the run sends the permalink plus the canonical thread URL and
+ * the linked comment is validated, deduped and rendered first. Billing is
+ * per stored item — the permalink adds at most ONE item over a plain thread
+ * fetch (probes 2026-10-12: dual-URL runs stored 4–8 items, ceiling
+ * maxComments + 2 ≈ $0.058; the anchor survived a maxItems-bound run).
  */
 const APIFY_RUN_URL =
   "https://api.apify.com/v2/acts/trudax~reddit-scraper-lite/run-sync-get-dataset-items"
@@ -394,18 +454,21 @@ async function redditViaApify(url, budgetMs, outerSignal) {
   const t0 = Date.now()
   const token = process.env.APIFY_TOKEN
   if (!token) return { ok: false, reason: "no APIFY_TOKEN" }
-  const target = url.replace(/^(https?:\/\/)[^/]+/i, "$1www.reddit.com")
-  // Two accepted shapes: classic thread URLs (/comments/<id>[/slug]/) and
-  // /s/ share links (the form Reddit's Share button produces). NOTE: share
-  // links CANNOT be resolved locally — reddit 403s the short URL itself
-  // (verified 2026-10-11, even with a browser UA), but the actor's stealth
-  // browser resolves them; its returned post.url is the canonical thread.
-  // Subreddit/user/search URLs stay on the Exa path.
-  const isThread = /reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i.test(target)
-  const isShare = /reddit\.com\/(?:r\/[^/]+\/)?s\/[A-Za-z0-9]+/i.test(target)
-  if (!isThread && !isShare) return { ok: false, reason: "not a thread URL; skipping apify" }
-  const m = target.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i)
+  const shape = parseRedditShape(url)
+  if (!shape || (shape.kind !== "thread" && shape.kind !== "comment" && shape.kind !== "share"))
+    return { ok: false, reason: "not a thread URL; skipping apify" }
   const maxComments = Math.max(1, Math.min(50, Number(process.env.APIFY_MAX_COMMENTS) || 15))
+  // Actor-facing URLs: canonical host (the actor's stealth browser also
+  // resolves /s/ share links, which reddit 403s to plain clients — verified
+  // 2026-10-11), query strings stripped via parseRedditShape's pathname.
+  // Comment permalinks additionally pass the canonical thread URL: one run
+  // yields post + top comments AND the anchored comment.
+  const actorUrl = `https://www.reddit.com${shape.path}`
+  const threadUrl =
+    shape.sub && shape.threadId ? `https://www.reddit.com/r/${shape.sub}/comments/${shape.threadId}/` : null
+  const anchorId = shape.commentId ? shape.commentId.toLowerCase() : null
+  // Actor ids look like "t1_<base36>"; parsedId carries the bare form.
+  const normId = (it) => String(it?.parsedId ?? it?.id ?? "").replace(/^t[13]_/i, "").toLowerCase()
   try {
     // Browser-based scrape: runs legitimately take 30-90s — longer than any
     // single chain layer, so give the run the whole budget plus slack.
@@ -413,12 +476,12 @@ async function redditViaApify(url, budgetMs, outerSignal) {
     // shown transient 502s (actor platform flakiness, observed live
     // 2026-10-11). 4xx is never retried. Each attempt gets the full budget;
     // the caller's own timeout remains the hard ceiling.
-    const apifyInit = {
+    const runInput = (startUrls, maxItems) => ({
       method: "POST",
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({
-        startUrls: [{ url: target }],
-        maxItems: maxComments + 1,
+        startUrls,
+        maxItems,
         maxPostCount: 1,
         maxComments,
         skipCommunity: true,
@@ -426,57 +489,104 @@ async function redditViaApify(url, budgetMs, outerSignal) {
         navigationTimeout: 30,
         proxy: { useApifyProxy: true },
       }),
-    }
+    })
     const runBudget = Math.min(budgetMs + 60_000, 180_000)
-    let res = await timedFetch(APIFY_RUN_URL, apifyInit, runBudget, outerSignal)
-    if (res.status >= 500) {
+    const runOnce = async (startUrls, maxItems) => {
+      let res = await timedFetch(APIFY_RUN_URL, runInput(startUrls, maxItems), runBudget, outerSignal)
+      if (res.status >= 500) {
+        try {
+          await res.body?.cancel()
+        } catch {}
+        await new Promise((resolve) => setTimeout(resolve, 5_000))
+        res = await timedFetch(APIFY_RUN_URL, runInput(startUrls, maxItems), runBudget, outerSignal)
+      }
+      const data = await res.json().catch(() => null)
+      if (!res.ok || !Array.isArray(data)) {
+        const detail = data ? JSON.stringify(data).slice(0, 160) : res.statusText
+        throw new Error(`${res.status}: ${detail}`)
+      }
+      return data
+    }
+    const items = await runOnce(
+      shape.kind === "comment" ? [{ url: actorUrl }, { url: threadUrl }] : [{ url: actorUrl }],
+      shape.kind === "comment" ? maxComments + 2 : maxComments + 1,
+    )
+    const post = items.find((it) => it?.dataType === "post" && it.body)
+    let anchor = anchorId
+      ? items.find((it) => it?.dataType === "comment" && it.body && normId(it) === anchorId)
+      : undefined
+    // Guarantee the anchor: URL-processing order inside the actor is not
+    // documented and has been observed both first and last, so a binding
+    // maxItems could in principle drop it. A permalink-only retry costs
+    // 1 stored item and cannot be starved.
+    if (anchorId && !anchor) {
       try {
-        await res.body?.cancel()
+        const retry = await runOnce([{ url: actorUrl }], 2)
+        anchor = retry.find((it) => it?.dataType === "comment" && it.body && normId(it) === anchorId)
+        if (anchor) items.push(anchor)
       } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 5_000))
-      res = await timedFetch(APIFY_RUN_URL, apifyInit, runBudget, outerSignal)
     }
-    const items = await res.json().catch(() => null)
-    if (!res.ok || !Array.isArray(items)) {
-      const detail = items ? JSON.stringify(items).slice(0, 160) : res.statusText
-      return { ok: false, reason: `apify ${res.status}: ${detail}` }
-    }
-    const post = items.find((it) => it?.dataType === "post")
-    if (!post?.body) return { ok: false, reason: `apify: no post in ${items.length} items` }
-    const comments = items.filter((it) => it?.dataType === "comment" && it.body)
+    if (!post && !anchor)
+      return { ok: false, reason: `apify: no post${anchorId ? " or anchor comment" : ""} in ${items.length} items` }
+    // dedupe — the anchored comment is emitted twice across the two start URLs
+    const seen = new Set()
+    const comments = items
+      .filter((it) => it?.dataType === "comment" && it.body)
+      .filter((it) => {
+        const k = normId(it)
+        if (seen.has(k)) return false
+        seen.add(k)
+        return true
+      })
+    const anchorKey = anchor ? normId(anchor) : null
+    const contextComments = comments.filter((c) => normId(c) !== anchorKey)
+    const meta = [
+      post?.communityName || (shape.sub ? `r/${shape.sub}` : ""),
+      post?.username ? `u/${post.username}` : "",
+      post && Number.isFinite(post.upVotes) ? `${post.upVotes} upvotes` : "",
+      post?.createdAt ? String(post.createdAt).slice(0, 10) : "",
+    ]
+      .filter(Boolean)
+      .join(" · ")
     const header = [
-      post.title ? `# ${post.title}` : "",
-      [
-        post.communityName || (m && m[1] ? `r/${m[1]}` : ""),
-        post.username ? `u/${post.username}` : "",
-        Number.isFinite(post.upVotes) ? `${post.upVotes} upvotes` : "",
-        post.createdAt ? String(post.createdAt).slice(0, 10) : "",
-      ]
-        .filter(Boolean)
-        .join(" · "),
-      post.url || "",
+      post?.title ? `# ${post.title}` : anchor ? "# Comment permalink (thread body not returned by the actor)" : "",
+      meta,
+      post?.url || threadUrl || "",
     ]
       .filter(Boolean)
       .join("\n\n")
-    const commentBlock = comments
-      .map(
-        (c) =>
-          `**u/${c.username || "unknown"}**${Number.isFinite(c.upVotes) ? ` · ${c.upVotes} points` : ""}\n\n${c.body}`,
-      )
-      .join("\n\n---\n\n")
+    const renderComment = (c, lead) =>
+      `${lead ? `${lead}\n\n` : ""}**u/${c.username || "unknown"}**${
+        Number.isFinite(c.upVotes) ? ` · ${c.upVotes} points` : ""
+      }\n\n${c.body}`
+    const commentBlocks = [
+      ...(anchor ? [renderComment(anchor, "→ **the linked comment**")] : []),
+      ...contextComments.map((c) => renderComment(c)),
+    ]
     const content = [
       `[retrieved via Apify reddit-scraper-lite: ${items.length} results, ~$${(items.length * APIFY_USD_PER_RESULT).toFixed(3)}]`,
       header,
-      post.body,
-      comments.length
-        ? `## Comments (${comments.length}${Number.isFinite(post.numberOfComments) ? ` of ${post.numberOfComments}` : ""})\n\n${commentBlock}`
+      post?.body ?? "",
+      commentBlocks.length
+        ? `## Comments${anchor ? " — linked comment first" : ""} (${commentBlocks.length}${
+            Number.isFinite(post?.numberOfComments) ? ` of ${post.numberOfComments}` : ""
+          })\n\n${commentBlocks.join("\n\n---\n\n")}`
+        : "",
+      anchor
+        ? "_Comment-anchored fetch: sibling context is the top comments as scraped; the scraper does not return the ancestor chain._"
         : "",
     ]
       .filter(Boolean)
       .join("\n\n")
-    return { ok: true, items: items.length, content, resolvedUrl: post.url, ms: Date.now() - t0 }
+    return {
+      ok: true,
+      items: items.length,
+      content,
+      resolvedUrl: post?.url || threadUrl || actorUrl,
+      ms: Date.now() - t0,
+    }
   } catch (error) {
-    return { ok: false, reason: `apify: ${String(error).slice(0, 120)}` }
+    return { ok: false, reason: `apify: ${String(error?.message || error).slice(0, 120)}` }
   }
 }
 
@@ -836,4 +946,13 @@ export const WebfetchAiPlugin = {
 export default WebfetchAiPlugin
 
 // test hook: the harness imports this directly (no plugin runtime needed)
-export const __tests = { fetchChain, ghParse, gateL0, classifyBody, route, stripHtmlToText }
+export const __tests = {
+  fetchChain,
+  ghParse,
+  gateL0,
+  classifyBody,
+  route,
+  stripHtmlToText,
+  parseRedditShape,
+  pickExaThreadBlock,
+}

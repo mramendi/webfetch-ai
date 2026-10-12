@@ -64,10 +64,13 @@ request
   │
   ├─ reddit.com ──────────────────────────────► Apify reddit-scraper-lite
   │    (full thread: post body + comments with authors/votes. Accepts
-  │     classic /comments/<id> URLs AND /s/ share links — the short form
-  │     is 403'd to plain clients but resolved by the actor's browser.
-  │     fallbacks: Exa /contents → Exa keyless MCP search-cache → chain.
-  │     Reddit 403s all direct fetching since the 2026 lockdown)
+  │     classic /comments/<id> URLs, comment permalinks
+  │     /comments/<id>/(slug|comment|_)/<commentId> — the linked comment is
+  │     anchored, rendered first, and cannot be starved by the comment cap —
+  │     AND /s/ share links, which are 403'd to plain clients but resolved
+  │     by the actor's browser. Fallbacks: Exa /contents → Exa keyless MCP
+  │     search-cache (hard thread-id match; a different thread is never
+  │     served) → chain. Reddit 403s all direct fetching since 2026)
   │
   └─ general chain:
        L0 plain fetch (Chrome UA) ── deterministic quality gate:
@@ -98,7 +101,7 @@ why each was rejected.
 | GitHub lane | api.github.com + raw CDN | free (60 req/h unauthenticated; `GITHUB_TOKEN` raises it) |
 | L0 | plain fetch | free |
 | L1 | your own playwright-ai container | free (local compute) |
-| Reddit lane | Apify `trudax/reddit-scraper-lite` | pay-per-result ≈ $0.0034/item; comment count is capped (`APIFY_MAX_COMMENTS`, default 15) → ≈ $0.05/fetch ceiling |
+| Reddit lane | Apify `trudax/reddit-scraper-lite` | pay-per-result ≈ $0.0034/item; threads cap at `APIFY_MAX_COMMENTS`+1 items, comment-anchored fetches at +2 → ≈ $0.058/fetch ceiling |
 | L2 | Exa `/contents` | $1/1k pages; only spent when L0/L1 fail the gate |
 
 Every API is optional and the chain degrades gracefully: no `EXA_API_KEY`

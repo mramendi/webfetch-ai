@@ -206,3 +206,32 @@ probe against the live service. Overnight arc complete.
     (patent non-waiver), and a patent grant is moot for this artifact.
     MIT-style headers rejected because a `Copyright (c)` line asserts
     ownership — precisely the contested claim.
+
+## 2026-10-12 — comment permalinks + wrong-thread cache fix
+
+Two bugs found by a real-world comment-permalink fetch
+(`/comments/<id>/comment/<commentId>/`):
+
+1. **Apify lane**: the full permalink path was forwarded verbatim; the actor
+   resolves it to the anchor comment only (`dataType: "comment"`, no post),
+   and the post-only validation rejected the result (`no post in 1 items`).
+2. **Exa-cache fallback**: the URL-shape parser mistook the literal `comment`
+   segment for the thread slug → query `comment r/<sub>`; the substring
+   scorer then accepted any `/comments/` URL (slug `comment` ⊂ `/comments/`)
+   and served a DIFFERENT thread, labeled with that thread's URL.
+
+Probes (run-sync, ~$0.04 of credit): a dual-URL input (permalink + canonical
+thread) returns post + comments + anchor in ONE run — the anchor is emitted
+twice (dedupe by id), and it survived a maxItems-bound run (anchor present
+even with maxComments capped at 2 of 7). Actor ordering between the two URLs
+is nondeterministic (anchor observed both first and last). `parentId` is
+absent in fast mode (`includeMediaLinks: false`), so ancestor chains are not
+reconstructible on this actor. Billing is per stored item: the second URL
+adds at most one item (+$0.0034) over a plain thread fetch.
+
+Shipped: `parseRedditShape` (single URL-algebra source; `comment`/`_`
+placeholders never treated as slug; ids case-preserved), comment-aware
+Apify lane (dual-URL, maxItems = maxComments + 2, post-or-anchor validation,
+permalink-only retry guarantee, anchor rendered first, honest context note),
+`pickExaThreadBlock` hard thread-id equality rule, unit tests
+(`tests/reddit-shape.test.mjs`, 25 cases, no network). CHANGELOG.md started.
