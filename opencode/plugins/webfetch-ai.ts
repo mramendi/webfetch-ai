@@ -32,6 +32,15 @@ const MAX_CHARS = 400_000
 const MIN_TEXT_HTML = 120
 const MIN_TEXT_PLAIN = 50
 
+// node-html-markdown's translate() is superlinear on tag-soup inputs (measured
+// 2026-10-26: 100KB→165ms; a 1.1MB JSON with pseudo-HTML token strings → >30s,
+// never finished). translate() is synchronous, so a hang of that scale freezes
+// the whole OpenCode serve process — the client watchdog then kills and
+// respawns it. Two guards: never feed NON-markup bodies to the converter at
+// all, and bound the converter's input size (oversize degrades to text
+// extraction, which is linear and bounded).
+const NHM_MAX_INPUT = 262_144 // 256KB
+
 // Chrome-family UA without any bot tell (plain fetch layer only; L1 has its own).
 const CHROME_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -160,13 +169,14 @@ function classifyBody(contentType, body) {
   const challenge = CHALLENGE_MARKERS.some((m) => head.includes(m))
   const isHtml = ct.includes("text/html") || ct.includes("application/xhtml")
   const isPdf = ct.includes("application/pdf") || head.startsWith("%pdf-")
+  const isXml = ct.includes("xml") || head.trimStart().startsWith("<?xml")
   const textual =
     ct.includes("text/") ||
     ct.includes("application/json") ||
     ct.includes("application/xml") ||
     ct.includes("javascript") ||
     ct === "" && !isPdf
-  return { ct, isHtml, isPdf, textual, challenge }
+  return { ct, isHtml, isXml, isPdf, textual, challenge }
 }
 
 function gateL0(status, contentType, body, elapsedMs) {
@@ -183,7 +193,7 @@ function gateL0(status, contentType, body, elapsedMs) {
     const ratio = text.length / body.length
     if (ratio < 0.02) return { ok: false, reason: `text/markup ratio ${(ratio * 100).toFixed(1)}% < 2%` }
   }
-  return { ok: true, isHtml: k.isHtml, textLen: text.length, elapsedMs }
+  return { ok: true, isHtml: k.isHtml, isXml: k.isXml, textLen: text.length, elapsedMs }
 }
 
 // ---------------------------------------------------------------- L0 fetch
@@ -748,6 +758,57 @@ function budgetFor(totalSec) {
   }
 }
 
+/**
+ * Shape a passing L0 fetch into a tool result. Pure: module-level helpers and
+ * constants only (no closure over fetchChain).
+ *
+ * Markdown is the only format that runs the HTML→markdown converter, and the
+ * converter only ever sees real markup inside the size bound — see §2.4 of
+ * specs/2026-10-26-nhm-hang-fix.md and NHM_MAX_INPUT for the incident.
+ */
+function renderL0(l0, format) {
+  const body = l0.body
+  const verdict = l0.verdict
+  const contentType = l0.contentType
+  const isMarkup = !!(verdict.isHtml || verdict.isXml)
+  // Non-markup bodies are already text: stripping/compiling them through an HTML
+  // pipeline is wrong (mangles JSON pseudo-tags) and, at scale, hazardous.
+  const finalText =
+    format === "html" ? body
+    : format === "text" ? (isMarkup ? stripHtmlToText(body) : body)
+    : null
+  if (format !== "markdown") {
+    return {
+      content: (finalText || "").slice(0, MAX_CHARS),
+      metadata: { layer: "L0", contentType, format },
+    }
+  }
+  if (!isMarkup || body.length > NHM_MAX_INPUT) {
+    // JSON/plain/javascript → verbatim; oversize markup → linear text
+    // extraction instead of risking the converter hang.
+    const text = isMarkup ? stripHtmlToText(body) : body
+    return {
+      content: text.slice(0, MAX_CHARS),
+      metadata: {
+        layer: "L0",
+        contentType,
+        format: isMarkup ? "text (oversize, converter skipped)" : "text (non-markup, verbatim)",
+      },
+    }
+  }
+  const t0 = Date.now()
+  const md = htmlToMarkdown(body)
+  if (md !== null) {
+    fileLog({ event: "rendered", layer: "L0", ms: Date.now() - t0, outLen: md.length })
+    return { content: md.slice(0, MAX_CHARS), metadata: { layer: "L0", contentType } }
+  }
+  // converter unavailable: degrade to text rather than burning L1 for cosmetics
+  return {
+    content: stripHtmlToText(body).slice(0, MAX_CHARS),
+    metadata: { layer: "L0", contentType, format: "text (converter unavailable)" },
+  }
+}
+
 async function fetchChain(input, signal) {
   const url = input.url
   const format = input.format || "markdown"
@@ -830,22 +891,7 @@ async function fetchChain(input, signal) {
   }
 
   if (l0.verdict.ok) {
-    const finalText = format === "html" ? l0.body : format === "text" ? stripHtmlToText(l0.body) : null
-    if (format !== "markdown") {
-      return {
-        content: (finalText || "").slice(0, MAX_CHARS),
-        metadata: { layer: "L0", contentType: l0.contentType, format },
-      }
-    }
-    const md = htmlToMarkdown(l0.body)
-    if (md !== null) {
-      return { content: md.slice(0, MAX_CHARS), metadata: { layer: "L0", contentType: l0.contentType } }
-    }
-    // converter unavailable: degrade to text rather than burning L1 for cosmetics
-    return {
-      content: stripHtmlToText(l0.body).slice(0, MAX_CHARS),
-      metadata: { layer: "L0", contentType: l0.contentType, format: "text (converter unavailable)" },
-    }
+    return renderL0(l0, format)
   }
 
   if (l0.verdict.pdf) {
@@ -955,4 +1001,5 @@ export const __tests = {
   stripHtmlToText,
   parseRedditShape,
   pickExaThreadBlock,
+  renderL0,
 }
